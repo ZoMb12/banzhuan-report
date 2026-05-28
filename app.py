@@ -272,7 +272,8 @@ with tabs[0]:
 
                 if st.button("🔄 重试全部失败饰品", type="primary",
                               use_container_width=True, key="retry_all"):
-                    batch_result = _steam.retry_steam_failed_items(_failed_step3)
+                    with st.spinner(f"正在批量重试 {len(_failed_step3)} 个失败饰品..."):
+                        batch_result = _steam.retry_steam_failed_items(_failed_step3)
                     ok = 0
                     for fi in _failed_step3:
                         data = batch_result.get(fi["item_id"])
@@ -282,7 +283,12 @@ with tabs[0]:
                     st.session_state.failed_step3_items = [
                         f for f in _failed_step3 if f["item_id"] not in batch_result
                     ]
-                    st.success(f"重试完成: {ok}/{len(_failed_step3)} 成功")
+                    if ok == len(_failed_step3):
+                        st.success(f"✅ 全部重试成功: {ok}/{len(_failed_step3)}")
+                    elif ok > 0:
+                        st.warning(f"部分重试成功: {ok}/{len(_failed_step3)}，剩余 {len(_failed_step3)-ok} 条仍失败")
+                    else:
+                        st.error(f"全部重试失败: 0/{len(_failed_step3)}，请检查代理或Steam登录状态")
                     st.rerun()
 
         # ── 目标饰品展示 ──
@@ -855,14 +861,21 @@ with tabs[0]:
                                         st.error(f"❌ 重试失败: {_steam.get_last_steam_error()}")
 
                         if st.button("🔄 重试全部", type="primary", key="step3_retry_all", use_container_width=True):
-                            batch_result = _steam.retry_steam_failed_items(_failed)
+                            with st.spinner(f"正在批量重试 {len(_failed)} 个失败饰品..."):
+                                batch_result = _steam.retry_steam_failed_items(_failed)
                             ok = 0
                             for fi in _failed:
                                 data = batch_result.get(fi["item_id"])
                                 if data:
                                     st.session_state.steam_data_by_item[fi["item_id"]] = data
                                     ok += 1
-                            st.success(f"重试完成: {ok}/{len(_failed)} 成功")
+                            if ok == len(_failed):
+                                st.success(f"✅ 全部重试成功: {ok}/{len(_failed)}")
+                            elif ok > 0:
+                                st.warning(f"部分重试成功: {ok}/{len(_failed)}，剩余 {len(_failed)-ok} 条仍失败")
+                            else:
+                                st.error(f"全部重试失败: 0/{len(_failed)}，请检查代理或Steam登录状态")
+                            st.rerun()
 
                 # Steam 诊断
                 if windows_with_steam:
