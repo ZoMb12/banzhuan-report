@@ -23,9 +23,29 @@ st.set_page_config(page_title="搬砖报表", layout="wide")
 # 隐藏 Streamlit 默认元素
 st.markdown("""
 <style>
-    #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
+
+    /* 只隐藏部署按钮和状态，保留汉堡菜单（侧边栏开关） */
+    header .stDeployButton {display: none !important;}
+    header [data-testid="stStatusWidget"] {display: none !important;}
+    header [data-testid="stHeaderActionElements"] > *:last-child {display: none !important;}
+
+    /* 侧边栏收起后展开按钮放大 */
+    [data-testid="stSidebarCollapsedButton"] {
+        width: 32px !important;
+        height: 48px !important;
+        background: rgba(255,255,255,0.95) !important;
+        border: 1px solid #e0e0e0 !important;
+        border-left: none !important;
+        border-radius: 0 8px 8px 0 !important;
+        box-shadow: 2px 2px 8px rgba(0,0,0,0.1) !important;
+        z-index: 999999 !important;
+        transition: all 0.2s ease !important;
+    }
+    [data-testid="stSidebarCollapsedButton"]:hover {
+        background: #fff !important;
+        box-shadow: 2px 2px 12px rgba(0,0,0,0.2) !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -210,17 +230,26 @@ with tabs[0]:
         target_windows = [w for w in windows if w.is_target]
         _disp_rate = st.session_state.get("_run_conversion_rate", conversion_rate)
 
-        st.success(f"全流程完成！共 {len(windows)} 个合格窗口，{len(target_windows)} 个目标窗口")
+        items_from_buff = st.session_state.get("items_from_buff", [])
+        items_with_windows = len(set(w.item_id for w in windows))
+        s1_windows = len(windows)
+        s3_windows = len([w for w in windows if w.steam_avg_price_usd is not None])
+        s4_count = len(target_windows)
+
+        st.success(f"一键获取完成！BUFF筛选 {len(items_from_buff)} 条 → "
+                   f"价格稳定 {items_with_windows} 个饰品 / {s1_windows} 个窗口 → "
+                   f"Steam数据 {s3_windows}/{s1_windows} 个窗口 → "
+                   f"目标 {s4_count} 个窗口")
 
         # ── 分步状态与重新执行按钮 ──
         st.divider()
-        s1_count = len(st.session_state.qualifying_windows)
-        s3_count = len([w for w in windows if w.steam_avg_price_usd is not None])
-        s4_count = len(target_windows)
+        _pass_rate = f"{items_with_windows}/{len(items_from_buff)}" if items_from_buff else "N/A"
+        _s3_delta = "全部成功 ✅" if s3_windows >= s1_windows else f"{s1_windows-s3_windows}个失败 ⚠️" if s1_windows else "N/A"
+        _s4_delta = f"共{s1_windows}个窗口" if s1_windows else "无数据 ❌"
 
         col_r1, col_r2, col_r3 = st.columns(3)
         with col_r1:
-            st.metric("Step 1+2 滑动窗口", f"{s1_count} 个窗口")
+            st.metric("Step 1+2 滑动窗口", f"{items_with_windows} 个饰品", delta=_pass_rate)
             if st.button("🔄 重新执行 Step 1→4", key="redo_all", use_container_width=True):
                 st.session_state.one_click_mode = None
                 st.session_state.stage1_done = False
@@ -231,9 +260,9 @@ with tabs[0]:
                 st.session_state.error_log = []
                 st.rerun()
         with col_r2:
-            st.metric("Step 3 Steam数据", f"{s3_count}/{s1_count}")
+            st.metric("Step 3 Steam数据", f"{s3_windows}/{s1_windows}", delta=_s3_delta)
         with col_r3:
-            st.metric("Step 4 目标窗口", f"{s4_count}")
+            st.metric("Step 4 目标窗口", f"{s4_count} 个", delta=_s4_delta)
             if st.button("🔄 重新执行 Step 3→4", key="redo_s34", use_container_width=True):
                 st.session_state.stage2_done = False
                 st.session_state.stage3_done = False
@@ -376,8 +405,13 @@ with tabs[0]:
             # 导出Excel
             st.divider()
             st.subheader("导出Excel报表")
-            filepath = export_to_excel(target_windows, conversion_rate)
-            st.success(f"Excel 已导出: {filepath}")
+            if st.button("📥 导出Excel报表", type="primary", use_container_width=True, key="export_excel"):
+                with st.spinner("正在生成 Excel..."):
+                    filepath = export_to_excel(target_windows, conversion_rate)
+                    st.session_state.export_path = filepath
+                st.success(f"✅ Excel 已导出: {filepath}")
+            if st.session_state.get("export_path"):
+                st.info(f"上次导出: {st.session_state.export_path}")
 
         _show_error_log()
         st.divider()
