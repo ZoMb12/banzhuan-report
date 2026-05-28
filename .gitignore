@@ -1,0 +1,15 @@
+# Cookie / 登录态（敏感信息）
+storage/
+
+# 导出文件
+exports/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 本地设置
+.claude/settings.local.json
+
+# 环境变量
+.env
