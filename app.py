@@ -18,6 +18,7 @@ import core.steam_scraper as _steam
 from core.filters import apply_initial_filters, find_stable_windows
 from core.excel_exporter import export_to_excel
 from data.models import ItemSnapshot, WindowResult
+from data.database import init_db, create_run, save_step1, save_step2, save_step3, finish_run
 from utils.helpers import sleep_random
 
 st.set_page_config(page_title="搬砖报表", layout="wide")
@@ -55,9 +56,27 @@ st.title("搬砖报表")
 st.caption("滑动窗口扫描 · 24天稳定性筛选 · Steam比价 · Excel导出")
 
 today = date.today()
+init_db()
 
 
 # ---------- 错误日志 ----------
+def _clear_downstream_steps(from_step: int):
+    """清空从 from_step 开始的所有下游结果（1-indexed）。"""
+    if from_step <= 1:
+        st.session_state.stage1_done = False
+        st.session_state.raw_items = []
+        st.session_state.items_from_buff = []
+        st.session_state.qualifying_windows = []
+    if from_step <= 2:
+        st.session_state.stage2_done = False
+        st.session_state.steam_data_by_item = {}
+    if from_step <= 3:
+        st.session_state.stage3_done = False
+    if from_step <= 4:
+        st.session_state.stage4_done = False
+        st.session_state.export_path = ""
+
+
 def _log_error(step: int, item_id: str, item_name: str, error: str,
                context: dict = None):
     from datetime import datetime as _dt
@@ -97,9 +116,29 @@ def _show_error_log():
                             val = val[:300] + "..."
                         st.code(f"{k}: {val}")
 
+        # 导出诊断信息
+        import json as _json
+        _diag = []
+        for e in errors:
+            _diag.append({
+                "step": e["step"], "item_id": e.get("item_id", ""),
+                "item_name": e.get("item_name", ""), "error": e["error"],
+                "context": e.get("context", {}),
+            })
+        _diag_json = _json.dumps(_diag, ensure_ascii=False, indent=2, default=str)
+        st.download_button(
+            "📋 导出诊断信息",
+            data=_diag_json,
+            file_name=f"error_diagnostic_{date.today().isoformat()}.json",
+            mime="application/json",
+            use_container_width=True,
+            help="导出所有错误日志及上下文，供开发者分析",
+        )
+
 
 def _snapshot_params():
     st.session_state._param_snapshot = {
+        "category_names": list(category_names) if category_names else [],
         "stable_days": stable_days,
         "volatility_threshold": volatility_threshold,
         "target_count": target_count,
@@ -192,8 +231,9 @@ with st.sidebar:
         if st.session_state.get("stage1_done"):
             if (stable_days != _snap.get("stable_days") or
                 volatility_threshold != _snap.get("volatility_threshold") or
-                lookback_days != _snap.get("lookback_days")):
-                affected.append("Step 1+2 窗口/阈值/回溯")
+                lookback_days != _snap.get("lookback_days") or
+                category_names != _snap.get("category_names")):
+                affected.append("Step 1+2 窗口/阈值/回溯/品类")
         if st.session_state.get("stage3_done"):
             if conversion_rate != _snap.get("conversion_rate"):
                 affected.append("Step 4 汇率转换比")
@@ -209,6 +249,7 @@ with tabs[0]:
     # ---- 初始化 session_state ----
     defaults = {
         "stage1_done": False, "items_from_buff": [],
+        "raw_items": [],
         "stage2_done": False, "qualifying_windows": [],
         "stage3_done": False, "steam_data_by_item": {},
         "stage4_done": False, "export_path": "",
@@ -217,6 +258,7 @@ with tabs[0]:
         "failed_step3_items": [],
         "_retry_feedback": None,
         "_param_snapshot": None,
+        "_run_id": None,
         "_run_conversion_rate": None,
     }
     for k, v in defaults.items():
@@ -358,6 +400,7 @@ with tabs[0]:
                 if w.avg_profit_rate and w.avg_profit_rate > item_summary[w.item_id]["best_profit_rate"]:
                     item_summary[w.item_id]["best_profit_rate"] = w.avg_profit_rate
 
+            steam_data = st.session_state.get("steam_data_by_item", {})
             rows = []
             for item_id, info in sorted(item_summary.items(),
                                          key=lambda x: -x[1]["best_diff"]):
@@ -366,8 +409,15 @@ with tabs[0]:
                     "目标窗口数": info["windows"],
                     "最佳均价差(¥)": f"¥{info['best_diff']:+.2f}",
                     "最佳利润率": f"{info['best_profit_rate']*100:.2f}%",
+                    "Steam链接": steam_data.get(item_id, {}).get("steam_url", ""),
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            st.dataframe(
+                pd.DataFrame(rows),
+                column_config={
+                    "Steam链接": st.column_config.LinkColumn("Steam链接", display_text="打开"),
+                },
+                use_container_width=True,
+            )
 
             # 窗口明细
             with st.expander("查看目标窗口明细"):
@@ -381,8 +431,15 @@ with tabs[0]:
                         "Steam均价(¥)": f"¥{w.steam_avg_price_cny:.2f}" if w.steam_avg_price_cny else "N/A",
                         "均价差": f"¥{w.avg_diff:+.2f}" if w.avg_diff else "N/A",
                         "利润率": f"{w.avg_profit_rate*100:.2f}%" if w.avg_profit_rate else "N/A",
+                        "Steam链接": steam_data.get(w.item_id, {}).get("steam_url", ""),
                     })
-                st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, height=400)
+                st.dataframe(
+                    pd.DataFrame(detail_rows),
+                    column_config={
+                        "Steam链接": st.column_config.LinkColumn("Steam链接", display_text="打开"),
+                    },
+                    use_container_width=True, height=400,
+                )
 
             # 图表
             with st.expander("📈 BUFF vs Steam 价格对比图表"):
@@ -457,15 +514,16 @@ with tabs[0]:
         if st.button("一键执行全部", type="primary", use_container_width=True,
                       help="自动依次执行第一二步→第三步→第四步，完成后可导出Excel"):
             st.session_state.one_click_mode = "running"
+            # Reset
+            _clear_downstream_steps(1)
             st.session_state.error_log = []
             st.session_state.failed_step3_items = []
-            # Reset
-            st.session_state.stage1_done = False
-            st.session_state.stage2_done = False
-            st.session_state.stage3_done = False
-            st.session_state.stage4_done = False
-            st.session_state.export_path = ""
             _snapshot_params()
+            st.session_state._run_id = create_run(
+                today, stable_days, volatility_threshold, lookback_days,
+                conversion_rate, target_count,
+            )
+            st.session_state.raw_items = []
 
             # --- Step 1+2 ---
             with st.status("Step 1/3: BUFF获取 → 滑动窗口筛选…", expanded=True) as status:
@@ -490,8 +548,8 @@ with tabs[0]:
                     def _fetch_and_scan(item):
                         sd = today - timedelta(days=lookback_days)
                         try:
+                            sleep_random(1.0, 2.0)  # 请求前等待，防 BUFF 限流
                             history = get_price_history(item.item_id, sd, today)
-                            sleep_random(0.15, 0.3)  # 轻量限流，防 BUFF API 限流
                         except Exception as e:
                             return item, [], f"价格历史API异常: {e}"
                         if history:
@@ -505,7 +563,7 @@ with tabs[0]:
 
                     done = 0
                     total = len(filtered)
-                    with ThreadPoolExecutor(max_workers=3) as executor:
+                    with ThreadPoolExecutor(max_workers=2) as executor:
                         futures = {executor.submit(_fetch_and_scan, item): item for item in filtered}
                         for future in as_completed(futures):
                             try:
@@ -527,6 +585,8 @@ with tabs[0]:
                 st.write(f"---")
                 st.write(f"**扫描完成：** {items_with_windows} 个饰品产生 {len(all_windows)} 个合格窗口")
                 status.update(label=f"✅ Step 1+2: 滑动窗口筛选 — {len(all_windows)} 个窗口", state="complete")
+                st.session_state.raw_items = items
+                save_step1(st.session_state._run_id, items, filtered, all_windows)
 
             # --- Step 3 ---
             with st.status("Step 2/3: Steam市场数据获取…", expanded=True) as status:
@@ -619,6 +679,15 @@ with tabs[0]:
                     st.write(f"---")
                     st.write(f"**Steam 数据获取完成：** {windows_with_steam}/{len(all_windows)} 个窗口有数据")
                     status.update(label=f"✅ Step 2/3: Steam数据 — {windows_with_steam}/{len(all_windows)} 个窗口", state="complete")
+
+                    # 持久化 — 去重窗口对应的饰品
+                    window_items = []
+                    seen = set()
+                    for w in all_windows:
+                        if w.item_id not in seen:
+                            seen.add(w.item_id)
+                            window_items.append(w)
+                    save_step2(st.session_state._run_id, window_items, steam_data_by_item)
                 else:
                     st.write("无合格窗口，跳过 Steam 数据获取")
                     status.update(label="⏭️ Step 2/3: 无合格窗口", state="complete")
@@ -656,6 +725,24 @@ with tabs[0]:
                 st.write(f"**比价完成：** {len(all_windows)} 个窗口，{target_count} 个目标窗口")
                 status.update(label=f"✅ Step 3/3: 比价筛选 — {target_count} 个目标窗口", state="complete")
 
+                # 持久化 — 按 item_id 汇总套利结果
+                arb_results = {}
+                for w in all_windows:
+                    if w.item_id not in arb_results:
+                        item_windows = [x for x in all_windows if x.item_id == w.item_id]
+                        latest = max(item_windows, key=lambda x: x.avg_diff if x.avg_diff else -999)
+                        arb_results[w.item_id] = {
+                            "item_id": w.item_id,
+                            "avg_buff_price": latest.buff_avg_price,
+                            "avg_steam_usd": latest.steam_avg_price_usd,
+                            "avg_steam_cny": latest.steam_avg_price_cny,
+                            "avg_diff": latest.avg_diff,
+                            "is_target": latest.is_target,
+                            "date_pairs": latest.date_pairs,
+                            "target_count": sum(1 for x in item_windows if x.is_target),
+                        }
+                save_step3(st.session_state._run_id, arb_results)
+
             st.session_state.stage1_done = True
             st.session_state.stage2_done = True
             st.session_state.stage3_done = True
@@ -680,23 +767,26 @@ with tabs[0]:
 
             btn_label = "执行第一、二步" if not st.session_state.stage1_done else "重新执行第一、二步"
             if st.button(btn_label, type="primary", use_container_width=True):
-                st.session_state.stage1_done = False
-                st.session_state.stage2_done = False
-                st.session_state.stage3_done = False
-                st.session_state.stage4_done = False
-                st.session_state.export_path = ""
+                _clear_downstream_steps(1)
                 st.session_state.error_log = []
                 st.session_state.failed_step3_items = []
                 st.session_state.one_click_mode = None
                 _snapshot_params()
+                if st.session_state._run_id is None:
+                    st.session_state._run_id = create_run(
+                        today, stable_days, volatility_threshold, lookback_days,
+                        conversion_rate, target_count,
+                    )
 
                 try:
-                    items = get_items_on_date(today, target_count=target_count)
+                    category_values = [config.CATEGORY_OPTIONS[n] for n in category_names if n != "全部/不限"]
+                    items = get_items_on_date(today, target_count=target_count, categories=category_values)
                 except Exception as e:
                     _log_error(1, "", "全部", f"BUFF列表获取异常: {e}")
                     items = []
                 filtered = apply_initial_filters(items)
                 st.session_state.items_from_buff = filtered
+                st.session_state.raw_items = items
                 st.info(f"BUFF 原始获取：{len(items)} 条 → 初步过滤：{len(filtered)} 条")
 
                 if filtered:
@@ -708,6 +798,7 @@ with tabs[0]:
                             text=f"[{i+1}/{len(filtered)}] 扫描 {item.name}",
                         )
                         start_date = today - timedelta(days=lookback_days)
+                        sleep_random(0.5, 1.0)  # 请求前等待，防 BUFF 限流
                         history = get_price_history(item.item_id, start_date, today)
                         if history:
                             windows = find_stable_windows(
@@ -727,6 +818,7 @@ with tabs[0]:
                 else:
                     st.warning("没有饰品通过初步筛选，请检查数据。")
 
+                save_step1(st.session_state._run_id, st.session_state.raw_items, filtered, all_windows)
                 st.session_state.stage1_done = True
                 st.rerun()
 
@@ -899,6 +991,16 @@ with tabs[0]:
                             w.steam_avg_price_usd = sum(r.price for r in matched_steam) / len(matched_steam)
 
                     st.session_state.steam_data_by_item = steam_data_by_item
+
+                    window_items = []
+                    seen = set()
+                    for w in windows:
+                        if w.item_id not in seen:
+                            seen.add(w.item_id)
+                            window_items.append(w)
+                    if st.session_state._run_id:
+                        save_step2(st.session_state._run_id, window_items, steam_data_by_item)
+
                     st.session_state.stage2_done = True
                     st.session_state.stage3_done = False
                     st.session_state.stage4_done = False
@@ -1048,6 +1150,23 @@ with tabs[0]:
                                 "steam_price_cny": (sr.price * conversion_rate) if sr else None,
                                 "diff": (rec.price - sr.price * conversion_rate) if sr else None,
                             })
+                    if st.session_state._run_id:
+                        arb_results = {}
+                        for w in windows:
+                            if w.item_id not in arb_results:
+                                item_windows = [x for x in windows if x.item_id == w.item_id]
+                                latest = max(item_windows, key=lambda x: x.avg_diff if x.avg_diff else -999)
+                                arb_results[w.item_id] = {
+                                    "item_id": w.item_id,
+                                    "avg_buff_price": latest.buff_avg_price,
+                                    "avg_steam_usd": latest.steam_avg_price_usd,
+                                    "avg_steam_cny": latest.steam_avg_price_cny,
+                                    "avg_diff": latest.avg_diff,
+                                    "is_target": latest.is_target,
+                                    "date_pairs": latest.date_pairs,
+                                    "target_count": sum(1 for x in item_windows if x.is_target),
+                                }
+                        save_step3(st.session_state._run_id, arb_results)
                     st.session_state.stage3_done = True
                     st.session_state.stage4_done = False
                     st.session_state._run_conversion_rate = conversion_rate
@@ -1064,6 +1183,7 @@ with tabs[0]:
                 )
 
                 if windows_with_data:
+                    steam_data = st.session_state.get("steam_data_by_item", {})
                     rows = []
                     for w in sorted(windows_with_data, key=lambda w: -(w.avg_diff or 0)):
                         rows.append({
@@ -1074,8 +1194,15 @@ with tabs[0]:
                             "均价差(¥)": f"¥{w.avg_diff:+.2f}",
                             "利润率": f"{w.avg_profit_rate*100:.2f}%" if w.avg_profit_rate else "N/A",
                             "判定": "目标" if w.is_target else "未达标",
+                            "Steam链接": steam_data.get(w.item_id, {}).get("steam_url", ""),
                         })
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                    st.dataframe(
+                        pd.DataFrame(rows),
+                        column_config={
+                            "Steam链接": st.column_config.LinkColumn("Steam链接", display_text="打开"),
+                        },
+                        use_container_width=True,
+                    )
 
                     # 图表
                     with st.expander("📈 BUFF vs Steam 价格对比图表"):

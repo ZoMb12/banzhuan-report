@@ -571,26 +571,52 @@ def get_steam_market_data_batch(
         steam_page = None
 
         try:
+            # ── ① 打开 BUFF 详情页 ──
+            buff_title = ""
             page.goto(goods_url, timeout=60000)
             page.wait_for_load_state("networkidle", timeout=60000)
             sleep_random(1.0, 2.0)
             buff_title = page.title()
 
+            # ── ② 检查 BUFF 页面是否正常 ──
             if any(kw in buff_title.lower()
                    for kw in ["页面不存在", "出错", "404", "not found", "error"]):
                 _last_error = "BUFF 详情页异常（页面不存在或已下架）"
+                _last_error_context = {
+                    "type": "buff_page_error",
+                    "group_items": len(group_members),
+                    "buff_url": goods_url,
+                    "page_title": buff_title,
+                    "detail": "代表饰品在 BUFF 上可能已下架，整组跳过",
+                }
                 print(f"[Steam][批] {_last_error} | title={buff_title}")
                 return results
 
+            # ── ③ 查找 Steam 按钮 ──
             btn = _find_steam_market_button(page)
             if not btn:
                 _last_error = "未找到 '查看Steam市场' 按钮"
+                _last_error_context = {
+                    "type": "button_not_found",
+                    "group_items": len(group_members),
+                    "buff_url": goods_url,
+                    "page_title": buff_title,
+                    "detail": "BUFF页面未加载完整或该组饰品均无Steam市场链接",
+                }
                 print(f"[Steam][批] {_last_error}")
                 return results
 
+            # ── ④ 跳转 Steam ──
             steam_page = _click_and_get_steam_page(page, context, btn)
             if steam_page is None:
                 _last_error = "无法打开 Steam 页面"
+                _last_error_context = {
+                    "type": "steam_page_not_opened",
+                    "group_items": len(group_members),
+                    "buff_url": goods_url,
+                    "page_title": buff_title,
+                    "detail": "href/dispatchEvent/当前标签页降级 三种方式均失败",
+                }
                 print(f"[Steam][批] {_last_error}")
                 return results
 
@@ -609,9 +635,16 @@ def get_steam_market_data_batch(
             steam_url = steam_page.url
             sleep_random(1.5, 2.5)
 
+            # ── ⑤ 提取 SSR buckets（一次提取，多次匹配） ──
             ssr_data = _extract_ssr_buckets(steam_page)
             if not ssr_data:
                 _last_error = "无法提取 Steam SSR buckets 数据"
+                _last_error_context = {
+                    "type": "ssr_extraction_failed",
+                    "group_items": len(group_members),
+                    "steam_url": steam_url[:100],
+                    "detail": "window.SSR.loaderData 不存在或格式不符",
+                }
                 print(f"[Steam][批] {_last_error}")
                 return results
 
@@ -619,6 +652,7 @@ def get_steam_market_data_batch(
             initial_fallback_id = ssr_data.get("initialFallbackBucketID")
             print(f"[Steam][批] 获取到 {len(buckets)} 个 bucket，处理 {len(group_members)} 个变体")
 
+            # ── ⑥ 逐个匹配变体 + 调用 pricehistory API ──
             for member in group_members:
                 item_id = member["item_id"]
                 buff_item_name = member["buff_item_name"]
@@ -684,6 +718,11 @@ def get_steam_market_data_batch(
         except Exception as e:
             import traceback
             _last_error = f"Steam 批处理异常: {e}"
+            _last_error_context = {
+                "type": "batch_exception",
+                "exception": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
+            }
             print(f"[Steam][批] {_last_error}")
             traceback.print_exc()
         finally:

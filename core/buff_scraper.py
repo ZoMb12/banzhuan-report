@@ -298,7 +298,7 @@ def ensure_login():
     print("登录完成后，请关闭Chrome窗口，系统将自动保存登录态。")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=False)
+        browser = p.chromium.launch(headless=False)
         context = browser.new_context()
         page = context.new_page()
         try:
@@ -372,7 +372,7 @@ def is_logged_in() -> bool:
 def _open_authenticated_page(url: str, cookie_path: str, label: str):
     """使用Playwright打开已认证页面，不自动关闭，供用户自行查看。"""
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=False)
+        browser = p.chromium.launch(headless=False)
         context = _create_context_with_cookies(browser, cookie_path)
         page = context.new_page()
         try:
@@ -394,7 +394,13 @@ def open_buff_page():
 
 
 def _create_context_with_cookies(browser, cookie_path: str) -> BrowserContext:
-    context = browser.new_context()
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    )
     cookies = _load_cookies_from(cookie_path)
     if cookies:
         context.add_cookies(cookies)
@@ -528,7 +534,7 @@ def get_items_on_date(target_date, target_count: int = 200,
 
     all_items = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
+        browser = p.chromium.launch(headless=True)
         context = _create_context_with_cookies(browser, config.COOKIE_PATH)
         page = context.new_page()
 
@@ -849,7 +855,7 @@ def get_full_price_history(item_id: str, time_label: str = "最近3个月") -> d
     result = {}
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
+        browser = p.chromium.launch(headless=True)
         context = _create_context_with_cookies(browser, config.COOKIE_PATH)
         page = context.new_page()
 
@@ -1052,7 +1058,7 @@ def diagnose_price_extraction(item_id: str, start_date: date, end_date: date) ->
                       "detail": f"直接 API 调用失败: {api_error}\n降级到 Playwright 浏览器提取"})
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
+        browser = p.chromium.launch(headless=True)
         context = _create_context_with_cookies(browser, config.COOKIE_PATH)
         page = context.new_page()
         _inject_network_hooks(page)       # 注入 JS 层 XHR/fetch/jQuery 拦截
