@@ -1,4 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
+from threading import Lock
 
 import pandas as pd
 import streamlit as st
@@ -130,7 +132,7 @@ with st.sidebar:
     st.subheader("卡价转换比")
     conversion_rate = st.number_input(
         "卡价转换比（美元 → 人民币）",
-        min_value=0.1, max_value=20.0, value=7.2, step=0.01,
+        min_value=0.1, max_value=20.0, value=5.0, step=0.01,
         help="用于将 Steam 美元价格转换为人民币",
     )
 
@@ -213,6 +215,7 @@ with tabs[0]:
         "one_click_mode": None,
         "error_log": [],
         "failed_step3_items": [],
+        "_retry_feedback": None,
         "_param_snapshot": None,
         "_run_conversion_rate": None,
     }
@@ -270,11 +273,23 @@ with tabs[0]:
                 st.session_state.one_click_mode = None
                 st.rerun()
 
+        # ── 重试反馈展示（跨越 rerun 持久显示） ──
+        _retry_fb = st.session_state.pop("_retry_feedback", None)
+        if _retry_fb:
+            _fb_type = _retry_fb["type"]
+            _fb_msg = _retry_fb["msg"]
+            if _fb_type == "success":
+                st.success(_fb_msg)
+            elif _fb_type == "warning":
+                st.warning(_fb_msg)
+            else:
+                st.error(_fb_msg)
+
         # ── 失败饰品重试 ──
         _failed_step3 = st.session_state.get("failed_step3_items", [])
         if _failed_step3:
             st.divider()
-            with st.expander(f"🔄 重试失败饰品（{len(_failed_step3)} 条）", expanded=False):
+            with st.expander(f"🔄 重试失败饰品（{len(_failed_step3)} 条）", expanded=len(_failed_step3) > 0):
                 for fi in _failed_step3:
                     name = fi["buff_item_name"]
                     col_a, col_b = st.columns([4, 1])
@@ -286,16 +301,18 @@ with tabs[0]:
                                 result = _steam.get_steam_market_data(
                                     fi["item_id"], fi["target_dates"], fi["buff_item_name"],
                                 )
-                            if result:
+                            if result and result.get("steam_price_history"):
                                 st.session_state.steam_data_by_item[fi["item_id"]] = result
                                 st.session_state.failed_step3_items = [
                                     f for f in st.session_state.failed_step3_items
                                     if f["item_id"] != fi["item_id"]
                                 ]
-                                st.success(f"✅ {name} 重试成功")
+                                st.session_state._retry_feedback = {
+                                    "type": "success", "msg": f"✅ {name} 重试成功"
+                                }
                                 st.rerun()
                             else:
-                                err = _steam.get_last_steam_error(item_id=fi["item_id"]) or "未知错误"
+                                err = _steam.get_last_steam_error(item_id=fi["item_id"]) or "获取失败"
                                 _log_error(3, fi["item_id"], name, err)
                                 st.error(f"❌ {name} 重试失败: {err}")
 
@@ -304,20 +321,22 @@ with tabs[0]:
                     with st.spinner(f"正在批量重试 {len(_failed_step3)} 个失败饰品..."):
                         batch_result = _steam.retry_steam_failed_items(_failed_step3)
                     ok = 0
+                    success_ids = set()
                     for fi in _failed_step3:
                         data = batch_result.get(fi["item_id"])
-                        if data:
+                        if data and data.get("steam_price_history"):
                             st.session_state.steam_data_by_item[fi["item_id"]] = data
+                            success_ids.add(fi["item_id"])
                             ok += 1
-                    st.session_state.failed_step3_items = [
-                        f for f in _failed_step3 if f["item_id"] not in batch_result
-                    ]
+                    remaining = [f for f in _failed_step3 if f["item_id"] not in success_ids]
+                    st.session_state.failed_step3_items = remaining
+                    msg = f"重试结果：{ok}/{len(_failed_step3)} 成功"
                     if ok == len(_failed_step3):
-                        st.success(f"✅ 全部重试成功: {ok}/{len(_failed_step3)}")
+                        st.session_state._retry_feedback = {"type": "success", "msg": f"✅ {msg}"}
                     elif ok > 0:
-                        st.warning(f"部分重试成功: {ok}/{len(_failed_step3)}，剩余 {len(_failed_step3)-ok} 条仍失败")
+                        st.session_state._retry_feedback = {"type": "warning", "msg": f"⚠️ {msg}，{len(remaining)} 条仍失败"}
                     else:
-                        st.error(f"全部重试失败: 0/{len(_failed_step3)}，请检查代理或Steam登录状态")
+                        st.session_state._retry_feedback = {"type": "error", "msg": f"❌ {msg}，请检查代理或Steam登录状态"}
                     st.rerun()
 
         # ── 目标饰品展示 ──
@@ -465,24 +484,43 @@ with tabs[0]:
 
                 all_windows = []
                 if filtered:
-                    st.write(f"### 正在对 {len(filtered)} 个饰品扫描滑动窗口…")
-                    for i, item in enumerate(filtered):
-                        st.write(f"  [{i+1}/{len(filtered)}] 扫描 {item.name}…")
-                        start_date = today - timedelta(days=lookback_days)
-                        history = get_price_history(item.item_id, start_date, today)
+                    st.write(f"### 正在对 {len(filtered)} 个饰品扫描滑动窗口（并行5线程）…")
+                    results_lock = Lock()
+
+                    def _fetch_and_scan(item):
+                        sd = today - timedelta(days=lookback_days)
+                        try:
+                            history = get_price_history(item.item_id, sd, today)
+                            sleep_random(0.15, 0.3)  # 轻量限流，防 BUFF API 限流
+                        except Exception as e:
+                            return item, [], f"价格历史API异常: {e}"
                         if history:
                             windows = find_stable_windows(
                                 item.item_id, item.name, history,
                                 window_days=stable_days, threshold=volatility_threshold,
                                 min_price=20.0,
                             )
-                            all_windows.extend(windows)
-                            if windows:
-                                st.write(f"    → {len(windows)} 个合格窗口")
-                        else:
-                            _log_error(1, item.item_id, item.name, "BUFF价格历史为空")
-                        if i < len(filtered) - 1:
-                            sleep_random(0.5, 1.0)
+                            return item, windows, None
+                        return item, [], "BUFF价格历史为空"
+
+                    done = 0
+                    total = len(filtered)
+                    with ThreadPoolExecutor(max_workers=3) as executor:
+                        futures = {executor.submit(_fetch_and_scan, item): item for item in filtered}
+                        for future in as_completed(futures):
+                            try:
+                                item, windows, err = future.result()
+                            except Exception as e:
+                                item = futures[future]
+                                windows = []
+                                err = f"线程执行异常: {e}"
+                            done += 1
+                            if err:
+                                _log_error(1, item.item_id, item.name, err)
+                            with results_lock:
+                                all_windows.extend(windows)
+                            st.write(f"  [{done}/{total}] {item.name} → {len(windows)} 个窗口")
+                            status.update(label=f"Step 1/3: 滑动窗口筛选 ({done}/{total})")
 
                 st.session_state.qualifying_windows = all_windows
                 items_with_windows = len(set(w.item_id for w in all_windows))
@@ -523,6 +561,7 @@ with tabs[0]:
 
                     for base_name, group_items in groups.items():
                         group_idx += 1
+                        status.update(label=f"Step 2/3: Steam市场数据 ({group_idx}/{len(groups)} 皮肤组)")
                         st.write(f"  [{group_idx}/{len(groups)}] 皮肤组: {base_name} ({len(group_items)} 个变体)")
 
                         group_members = []
@@ -555,7 +594,7 @@ with tabs[0]:
                                 st.session_state.failed_step3_items.append(member)
 
                         if group_idx < len(groups):
-                            sleep_random(2.0, 3.0)
+                            sleep_random(1.0, 1.5)
 
                     # 分发 Steam 数据到各窗口
                     for w in all_windows:
@@ -680,8 +719,6 @@ with tabs[0]:
                             all_windows.extend(windows)
                         else:
                             _log_error(1, item.item_id, item.name, "BUFF价格历史为空")
-                        if i < len(filtered) - 1:
-                            sleep_random(0.5, 1.0)
                     progress_bar.empty()
 
                     st.session_state.qualifying_windows = all_windows
@@ -838,7 +875,7 @@ with tabs[0]:
 
                         progress_bar.progress(group_idx / group_count)
                         if group_idx < group_count:
-                            sleep_random(2.0, 3.0)
+                            sleep_random(1.0, 1.5)
 
                     progress_bar.empty()
                     status_text.empty()
@@ -873,10 +910,15 @@ with tabs[0]:
                 windows_with_steam = [w for w in windows if w.steam_avg_price_usd is not None]
                 st.success(f"Steam数据获取完成：{len(windows_with_steam)}/{len(windows)} 个窗口获取到Steam数据")
 
+                # ── 重试反馈展示 ──
+                _retry_fb = st.session_state.pop("_retry_feedback", None)
+                if _retry_fb:
+                    getattr(st, _retry_fb["type"])(_retry_fb["msg"])
+
                 # 重试失败饰品
                 _failed = st.session_state.get("failed_step3_items", [])
                 if _failed:
-                    with st.expander(f"🔄 重试失败饰品（{len(_failed)} 条）", expanded=False):
+                    with st.expander(f"🔄 重试失败饰品（{len(_failed)} 条）", expanded=len(_failed) > 0):
                         for fi in _failed:
                             col_a, col_b = st.columns([4, 1])
                             with col_a:
@@ -887,28 +929,41 @@ with tabs[0]:
                                         result = _steam.get_steam_market_data(
                                             fi["item_id"], fi["target_dates"], fi["buff_item_name"],
                                         )
-                                    if result:
+                                    if result and result.get("steam_price_history"):
                                         st.session_state.steam_data_by_item[fi["item_id"]] = result
-                                        st.success(f"✅ 重试成功")
+                                        st.session_state.failed_step3_items = [
+                                            f for f in st.session_state.failed_step3_items
+                                            if f["item_id"] != fi["item_id"]
+                                        ]
+                                        st.session_state._retry_feedback = {
+                                            "type": "success", "msg": f"✅ {fi['buff_item_name']} 重试成功"
+                                        }
                                         st.rerun()
                                     else:
-                                        st.error(f"❌ 重试失败: {_steam.get_last_steam_error()}")
+                                        err = _steam.get_last_steam_error(item_id=fi["item_id"]) or "获取失败"
+                                        _log_error(3, fi["item_id"], fi["buff_item_name"], err)
+                                        st.error(f"❌ 重试失败: {err}")
 
                         if st.button("🔄 重试全部", type="primary", key="step3_retry_all", use_container_width=True):
                             with st.spinner(f"正在批量重试 {len(_failed)} 个失败饰品..."):
                                 batch_result = _steam.retry_steam_failed_items(_failed)
                             ok = 0
+                            success_ids = set()
                             for fi in _failed:
                                 data = batch_result.get(fi["item_id"])
-                                if data:
+                                if data and data.get("steam_price_history"):
                                     st.session_state.steam_data_by_item[fi["item_id"]] = data
+                                    success_ids.add(fi["item_id"])
                                     ok += 1
+                            remaining = [f for f in _failed if f["item_id"] not in success_ids]
+                            st.session_state.failed_step3_items = remaining
+                            msg = f"重试结果：{ok}/{len(_failed)} 成功"
                             if ok == len(_failed):
-                                st.success(f"✅ 全部重试成功: {ok}/{len(_failed)}")
+                                st.session_state._retry_feedback = {"type": "success", "msg": f"✅ {msg}"}
                             elif ok > 0:
-                                st.warning(f"部分重试成功: {ok}/{len(_failed)}，剩余 {len(_failed)-ok} 条仍失败")
+                                st.session_state._retry_feedback = {"type": "warning", "msg": f"⚠️ {msg}，{len(remaining)} 条仍失败"}
                             else:
-                                st.error(f"全部重试失败: 0/{len(_failed)}，请检查代理或Steam登录状态")
+                                st.session_state._retry_feedback = {"type": "error", "msg": f"❌ {msg}"}
                             st.rerun()
 
                 # Steam 诊断
