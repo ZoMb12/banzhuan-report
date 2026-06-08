@@ -36,6 +36,12 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
+> **💡 快捷方式**：项目提供自动化部署脚本，AI Agent 或用户可直接运行：
+> - **Windows**: 双击 `setup.bat` 或在终端执行 `setup.bat`
+> - **macOS/Linux**: 终端执行 `bash setup.sh`
+>
+> 脚本会自动检查环境、安装依赖、安装 Playwright 并启动项目。
+
 > **注意**：如果 `playwright install chromium` 下载慢，可以手动下载 Chromium 并设置 `PLAYWRIGHT_BROWSERS_PATH` 环境变量。
 
 ## 首次使用
