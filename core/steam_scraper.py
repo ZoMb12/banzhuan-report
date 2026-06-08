@@ -17,10 +17,10 @@ try:
 except Exception:
     pass
 
-# 设置代理环境变量（确保 Playwright 内置 Chromium 能通过代理访问 Steam）
-os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7890")
-os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:7890")
-os.environ.setdefault("NO_PROXY", "buff.163.com,.163.com,.qq.com,.aliyuncs.com,.cn")
+# 注意：不在此处设置全局代理环境变量。
+# Playwright 浏览器通过 proxy=config.PROXY_CONFIG 控制代理，
+# 全局 HTTP_PROXY/HTTPS_PROXY 会影响 requests 库导致 BUFF API 请求异常。
+# Steam 访问的代理已在 config.PROXY_CONFIG 中配置，由 Playwright 直接使用。
 
 from playwright.sync_api import sync_playwright
 
@@ -50,18 +50,35 @@ def open_steam_market():
 
 
 def is_steam_logged_in() -> bool:
+    """通过轻量请求验证 Steam 登录态（steamLoginSecure cookie 是否真实有效）。"""
+    import requests as _requests
     cookies = _load_cookies_from(config.STEAM_COOKIE_PATH)
     if not cookies:
         return False
-    return any(c.get("name") == "steamLoginSecure" for c in cookies)
+    if not any(c.get("name") == "steamLoginSecure" for c in cookies):
+        return False
+    # 真实校验：请求 Steam 市场页，检查是否被重定向到登录
+    session = _requests.Session()
+    for c in cookies:
+        if c.get("name") and c.get("value"):
+            session.cookies.set(c["name"], c["value"],
+                               domain=c.get("domain", ".steamcommunity.com"))
+    try:
+        proxies = {"http": config.PROXY_SERVER, "https": config.PROXY_SERVER}
+        r = session.get("https://steamcommunity.com/market/",
+                       timeout=15, proxies=proxies, allow_redirects=True)
+        if r.status_code == 200 and "login" not in r.url.lower():
+            return True
+        return False
+    except Exception:
+        # 请求失败时降级为 cookie 名检查
+        return any(c.get("name") == "steamLoginSecure" for c in cookies)
 
 
 def ensure_steam_login():
-    cookies = _load_cookies_from(config.STEAM_COOKIE_PATH)
-    if cookies:
-        if any(c.get("name") == "steamLoginSecure" for c in cookies):
-            print("已检测到有效 Steam 登录态（steamLoginSecure），跳过登录。")
-            return
+    if is_steam_logged_in():
+        print("Steam 登录态有效，跳过登录。")
+        return
 
     print("正在打开 Chromium 浏览器，请在窗口中完成 Steam 登录...")
     print("登录完成后，关闭浏览器窗口即可，系统将自动保存登录态。")

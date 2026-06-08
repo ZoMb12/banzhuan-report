@@ -214,6 +214,7 @@ def _get_buff_price_history_direct(item_id: str, game: str = "csgo",
     if not cookies:
         return None, "无 cookies 文件或 cookies 为空"
     session = requests.Session()
+    session.trust_env = False  # 不走代理，直接请求 BUFF
     for c in cookies:
         session.cookies.set(c["name"], c["value"],
                            domain=c.get("domain", ".buff.163.com"))
@@ -286,13 +287,10 @@ def _parse_buff_api_lines(api_data: dict, start_date: date, end_date: date,
 
 
 def ensure_login():
-    """检查BUFF登录态，若无有效Cookie则打开浏览器让用户手动登录。"""
-    cookies = _load_cookies_from(config.COOKIE_PATH)
-    if cookies:
-        session_cookie_names = {"session", "buff_ss", "ntes_token"}
-        if any(c.get("name") in session_cookie_names for c in cookies):
-            print("已检测到有效登录态，跳过登录。")
-            return
+    """检查BUFF登录态（真实API校验），无效则打开浏览器让用户手动登录。"""
+    if is_logged_in():
+        print("BUFF 登录态有效，跳过登录。")
+        return
 
     print("正在打开Chrome浏览器，请在窗口中完成BUFF登录...")
     print("登录完成后，请关闭Chrome窗口，系统将自动保存登录态。")
@@ -361,16 +359,40 @@ def ensure_login():
 
 
 def is_logged_in() -> bool:
-    """检查本地是否保存了有效的BUFF登录Cookie。"""
+    """通过轻量 API 请求验证 BUFF 登录态是否真实有效。
+
+    注意：必须绕过代理直接请求（BUFF 是国内站，走代理反而可能超时）。
+    """
+    import requests as _requests
     cookies = _load_cookies_from(config.COOKIE_PATH)
     if not cookies:
         return False
     session_cookie_names = {"session", "buff_ss", "ntes_token"}
-    return any(c.get("name") in session_cookie_names for c in cookies)
+    if not any(c.get("name") in session_cookie_names for c in cookies):
+        return False
+    # 真实校验：用 cookie 请求 BUFF 通知 API，成功则登录有效
+    session = _requests.Session()
+    # ⚠️ 强制不走代理：BUFF 是国内站，全局代理可能导致超时/失败
+    session.trust_env = False
+    for c in cookies:
+        if c.get("name") and c.get("value"):
+            session.cookies.set(c["name"], c["value"],
+                               domain=c.get("domain", ".buff.163.com"))
+    try:
+        r = session.get("https://buff.163.com/api/message/notification",
+                       timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("code") == "OK":
+                return True
+        return False
+    except Exception:
+        # API 请求异常时不再降级——宁可信其无，让用户重新登录
+        return False
 
 
 def _open_authenticated_page(url: str, cookie_path: str, label: str):
-    """使用Playwright打开已认证页面，不自动关闭，供用户自行查看。"""
+    """使用Playwright打开已认证页面。关闭浏览器时自动保存/更新 cookie。"""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=False)
         context = _create_context_with_cookies(browser, cookie_path)
@@ -383,6 +405,13 @@ def _open_authenticated_page(url: str, cookie_path: str, label: str):
         except Exception:
             pass
         finally:
+            try:
+                # 关闭时保存当前所有 cookie（含本次登录新增的）
+                cur = context.cookies()
+                _save_cookies_to(cookie_path, cur)
+                print(f"{label} cookie 已更新（{len(cur)} 个）")
+            except Exception as e:
+                print(f"保存 {label} cookie 失败: {e}")
             try:
                 browser.close()
             except Exception:
